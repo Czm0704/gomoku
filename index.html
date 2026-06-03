@@ -220,6 +220,22 @@
         }
         #cancel-match-btn:hover { background-color: #b71c1c; }
 
+        /* ---- AI 按钮 ---- */
+        #ai-btn {
+            background: linear-gradient(135deg, #7b1fa2, #9c27b0);
+            font-size: 17px;
+            font-weight: bold;
+            padding: 12px 30px;
+        }
+        #ai-btn:hover { background: linear-gradient(135deg, #6a1b9a, #7b1fa2); }
+
+        .match-row {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
         .match-spinner {
             display: inline-block;
             width: 18px;
@@ -269,9 +285,10 @@
         </div>
 
         <!-- 分割线 -->
-        <div class="divider"><span>—— 随机匹配 ——</span></div>
-        <div>
-            <button id="match-btn">🎲 单人匹配</button>
+        <div class="divider"><span>—— 更多玩法 ——</span></div>
+        <div class="match-row">
+            <button id="match-btn">🎲 匹配真人</button>
+            <button id="ai-btn">🤖 对战 AI</button>
         </div>
         <div id="match-status" class="room-info"></div>
         <div>
@@ -360,6 +377,10 @@
         let matchCanceled = false;    // 是否取消了匹配
         let matchSlot     = -1;       // 当前匹配槽位
         const MATCH_SLOTS = 5;        // 匹配槽位数（0~4）
+
+        // ---------- AI 状态 ----------
+        let isAI        = false;      // 是否在对战 AI
+        let aiThinking  = false;      // AI 是否正在计算中
 
         // ---------- ICE 服务器配置（STUN + TURN，提高连接成功率）----------
         const ICE_SERVERS = {
@@ -487,6 +508,16 @@
                     ctx.font = 'bold 55px "Microsoft YaHei", "微软雅黑", sans-serif';
                     ctx.textAlign = 'center';
                     ctx.fillText('🏆 你赢了！✌️', canvas.width/2, canvas.height/2 - 15);
+
+                    ctx.fillStyle = '#ffeb3b';
+                    ctx.font = 'bold 18px "Microsoft YaHei", "微软雅黑", sans-serif';
+                    ctx.fillText('👆 双击棋盘重新开始', canvas.width/2, canvas.height/2 + 35);
+                } else if (isAI) {
+                    // ---- 输给 AI 了！----
+                    ctx.fillStyle = '#ff6b6b';
+                    ctx.font = 'bold 55px "Microsoft YaHei", "微软雅黑", sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('🤖 AI 获胜！', canvas.width/2, canvas.height/2 - 15);
 
                     ctx.fillStyle = '#ffeb3b';
                     ctx.font = 'bold 18px "Microsoft YaHei", "微软雅黑", sans-serif';
@@ -798,9 +829,13 @@
         //  双击棋盘落子
         // =====================================================
         canvas.addEventListener('dblclick', function (event) {
-            // 已结束 → 双击重开（只有房主可以发起重开请求）
+            // 已结束 → 双击重开
             if (gameOver) {
-                sendToPeer({ type: 'restart-request' });
+                if (isAI) {
+                    initBoard();
+                } else {
+                    sendToPeer({ type: 'restart-request' });
+                }
                 return;
             }
 
@@ -824,8 +859,8 @@
             // 停止我的计时
             stopTimer();
 
-            // 发送给对方
-            sendToPeer({ type: 'move', row, col, player: myPlayer });
+            // 发送给对方（仅联机模式）
+            if (!isAI) sendToPeer({ type: 'move', row, col, player: myPlayer });
 
             const result = checkWin(row, col);
             if (result) {
@@ -835,14 +870,22 @@
                 resetTimerDisplay();
                 drawBoard();
                 const name = result.player === 1 ? '⚫ 黑棋' : '⚪ 白棋';
-                statusText.textContent = `${name}（你）获胜！双击棋盘重开`;
+                statusText.textContent = isAI ? `${name}（你）获胜！双击棋盘重开` : `${name}（你）获胜！双击棋盘重开`;
                 statusText.style.color = '#2e7d32';
                 currentPlayerDot.style.backgroundColor = 'transparent';
             } else {
                 currentPlayer = (myPlayer === 1) ? 2 : 1;
                 drawBoard();
                 updateStatusDisplay();
-                // 对手回合的计时器在 updateStatusDisplay 中启动
+
+                // AI 模式：延迟后 AI 自动落子
+                if (isAI && !gameOver) {
+                    canvas.style.cursor = 'not-allowed';
+                    canvas.style.opacity = '0.85';
+                    setTimeout(function () {
+                        aiMakeMove();
+                    }, 350 + Math.random() * 300); // 350-650ms，模仿人类思考
+                }
             }
         });
 
@@ -1067,6 +1110,7 @@
             // 禁用其他按钮
             document.getElementById('create-room-btn').disabled = true;
             document.getElementById('join-room-btn').disabled = true;
+            aiBtn.disabled = true;
             roomInput.disabled = true;
             roomCodeDisplay.textContent = '';
 
@@ -1179,7 +1223,7 @@
             isMatching = false;
             matchBtn.disabled = true;
             matchBtn.classList.remove('matching');
-            matchBtn.innerHTML = '🎲 单人匹配';
+            matchBtn.innerHTML = '🎲 匹配真人';
             cancelMatchBtn.classList.add('hidden');
         }
 
@@ -1187,8 +1231,9 @@
             isMatching = false;
             matchBtn.disabled = false;
             matchBtn.classList.remove('matching');
-            matchBtn.innerHTML = '🎲 单人匹配';
+            matchBtn.innerHTML = '🎲 匹配真人';
             cancelMatchBtn.classList.add('hidden');
+            aiBtn.disabled = false;
             document.getElementById('create-room-btn').disabled = false;
             document.getElementById('join-room-btn').disabled = false;
             roomInput.disabled = false;
@@ -1198,27 +1243,183 @@
         cancelMatchBtn.addEventListener('click', cancelMatchmaking);
 
         // =====================================================
+        //  对战 AI
+        // =====================================================
+        const aiBtn = document.getElementById('ai-btn');
+
+        // ---- AI 评分核心：评估某个位置对某玩家的价值 ----
+        function aiEvalPos(row, col, player) {
+            let total = 0;
+            const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+            for (const [dx, dy] of dirs) {
+                let count = 1, openEnds = 0;
+                // 正方向
+                let r = row + dx, c = col + dy;
+                while (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]===player) { count++; r+=dx; c+=dy; }
+                if (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]===0) openEnds++;
+                // 反方向
+                r = row - dx; c = col - dy;
+                while (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]===player) { count++; r-=dx; c-=dy; }
+                if (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]===0) openEnds++;
+                total += aiPatternScore(count, openEnds);
+            }
+            return total;
+        }
+
+        function aiPatternScore(count, openEnds) {
+            if (count >= 5) return 1000000;
+            if (openEnds === 0) return 0;
+            if (count === 4) return openEnds===2 ? 100000 : 10000;
+            if (count === 3) return openEnds===2 ? 5000 : 1000;
+            if (count === 2) return openEnds===2 ? 500 : 100;
+            if (count === 1) return openEnds===2 ? 50 : 10;
+            return 0;
+        }
+
+        // ---- 检查某位置周围 2 格内是否有棋子（优化性能） ----
+        function aiHasNeighbor(row, col) {
+            for (let dr = -2; dr <= 2; dr++) {
+                for (let dc = -2; dc <= 2; dc++) {
+                    if (dr===0 && dc===0) continue;
+                    const r = row+dr, c = col+dc;
+                    if (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]!==0) return true;
+                }
+            }
+            return false;
+        }
+
+        // ---- AI 选择最佳落子 ----
+        function aiFindBestMove() {
+            const aiPlayer = 2;
+            const humanPlayer = 1;
+            let bestScore = -1;
+            let bestMoves = [];
+
+            for (let r = 0; r < BOARD_SIZE; r++) {
+                for (let c = 0; c < BOARD_SIZE; c++) {
+                    if (board[r][c] !== 0) continue;
+                    if (!aiHasNeighbor(r, c)) continue;
+
+                    const attack  = aiEvalPos(r, c, aiPlayer);
+                    const defense = aiEvalPos(r, c, humanPlayer);
+                    // 防守权重略高，优先堵对手的棋
+                    const score = Math.max(attack, defense * 1.05);
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestMoves = [{row: r, col: c}];
+                    } else if (score === bestScore && score > 0) {
+                        bestMoves.push({row: r, col: c});
+                    }
+                }
+            }
+
+            // 空棋盘 → 下天元
+            if (bestMoves.length === 0) return {row: 7, col: 7};
+            // 随机选一个最高分位置（增加变化）
+            return bestMoves[Math.floor(Math.random() * bestMoves.length)];
+        }
+
+        // ---- AI 执行落子 ----
+        function aiMakeMove() {
+            if (gameOver || !isAI) return;
+            aiThinking = true;
+
+            const move = aiFindBestMove();
+            const row = move.row, col = move.col;
+
+            // 落子
+            board[row][col] = 2; // AI 永远是白棋
+            moveHistory.push({ row, col, player: 2 });
+            lastMove = { row, col };
+
+            // 发消息（如果有联机连接才发，AI 模式不需要）
+            if (!isAI) sendToPeer({ type: 'move', row, col, player: 2 });
+
+            const result = checkWin(row, col);
+            if (result) {
+                gameOver = true;
+                winner = result;
+                stopTimer();
+                resetTimerDisplay();
+                drawBoard();
+                statusText.textContent = '🤖 AI 获胜！双击棋盘重开';
+                statusText.style.color = '#c62828';
+                currentPlayerDot.style.backgroundColor = 'transparent';
+                canvas.style.cursor = 'pointer';
+            } else {
+                currentPlayer = 1; // 回到玩家回合
+                drawBoard();
+                updateStatusDisplay(); // 启动玩家计时器
+            }
+            aiThinking = false;
+        }
+
+        // ---- 启动 AI 对战 ----
+        function startAIGame() {
+            // 清理旧连接
+            if (conn) { try { conn.close(); } catch(e) {} conn = null; }
+            if (peer) { try { peer.destroy(); } catch(e) {} peer = null; }
+
+            isAI = true;
+            amHost = true;
+            myPlayer = 1;        // 玩家永远是黑棋
+            myRoomCode = 'AI';
+            aiThinking = false;
+
+            document.getElementById('create-room-btn').disabled = true;
+            document.getElementById('join-room-btn').disabled = true;
+            roomInput.disabled = true;
+            matchBtn.disabled = true;
+            aiBtn.disabled = true;
+            matchStatusEl.textContent = '🤖 对战 AI 中...';
+            setStatus('🤖 对战 AI — 你是 ⚫ 黑棋（先手）', 'status-connected');
+            startGame();
+        }
+
+        aiBtn.addEventListener('click', startAIGame);
+
+        // =====================================================
         //  按钮事件
         // =====================================================
         document.getElementById('restart-btn').addEventListener('click', function () {
+            if (isAI) {
+                // AI 模式直接重开
+                initBoard();
+                return;
+            }
             sendToPeer({ type: 'restart-request' });
         });
 
         document.getElementById('undo-btn').addEventListener('click', function () {
             if (gameOver) return;
+            if (aiThinking) return; // AI 正在思考，不能悔棋
             if (currentPlayer !== myPlayer) {
                 alert('现在是对手的回合，不能悔棋哦~');
                 return;
             }
             if (moveHistory.length < 1) return;
 
-            // 请求悔棋（撤回自己刚下的一步）
+            if (isAI) {
+                // AI 模式：撤回两步（玩家+AI）
+                for (let i = 0; i < 2 && moveHistory.length > 0; i++) {
+                    const last = moveHistory.pop();
+                    board[last.row][last.col] = 0;
+                }
+                lastMove = moveHistory.length > 0 ? moveHistory[moveHistory.length - 1] : null;
+                currentPlayer = myPlayer;
+                drawBoard();
+                updateStatusDisplay();
+                return;
+            }
+
+            // 联机模式：请求悔棋
             sendToPeer({ type: 'undo-request', fromPlayer: myPlayer });
         });
 
         document.getElementById('leave-btn').addEventListener('click', function () {
-            if (confirm('确定要离开房间吗？')) {
-                sendToPeer({ type: 'player-left' });
+            if (confirm('确定要离开' + (isAI ? 'AI对战' : '房间') + '吗？')) {
+                if (!isAI) sendToPeer({ type: 'player-left' });
                 cleanup();
             }
         });
@@ -1263,6 +1464,8 @@
             resetTimerDisplay();
             matchCanceled = true;
             isMatching = false;
+            isAI = false;
+            aiThinking = false;
             if (conn) { conn.close(); conn = null; }
             if (peer) { peer.destroy(); peer = null; }
             gameArea.classList.add('hidden');
