@@ -481,7 +481,7 @@
         let isMatching    = false;    // 是否正在匹配中
         let matchCanceled = false;    // 是否取消了匹配
         let matchSlot     = -1;       // 当前匹配槽位
-        const MATCH_SLOTS = 5;        // 匹配槽位数（0~4）
+        const MATCH_SLOTS = 10;       // 匹配槽位数（0~9）
 
         // ---------- AI 状态 ----------
         let isAI        = false;      // 是否在对战 AI
@@ -1255,7 +1255,7 @@
                 if (settled) return;
                 settled = true;
                 try { guestPeer.destroy(); } catch (e) {}
-            }, 1800);
+            }, 1200);
 
             guestPeer.on('open', function () {
                 if (settled || matchCanceled || matchFound) return;
@@ -1351,41 +1351,50 @@
                 if (matchCanceled || matchFound || !roundActive) return;
                 roundActive = false;
                 try { hostPeer.destroy(); } catch (e) {}
-                // ID 冲突，换槽位
+                // ID 冲突，立即换槽位
                 if (!matchCanceled) {
-                    setTimeout(function () { doMatchRound(); }, 800);
+                    setTimeout(function () { doMatchRound(); }, 150 + Math.random() * 200);
                 }
             });
 
-            // ==== 扫描定时器：每 2.5 秒扫一次其他槽位 ====
+            // ==== 扫描：前 10s 激进(0.7s×3)，之后稳速(2s×2) ====
+            var roundStart = Date.now();
+            function doScan() {
+                if (matchCanceled || matchFound || !roundActive) return;
+                var fast = (Date.now() - roundStart) < 10000;
+                var count = fast ? 3 : 2;
+                for (var i = 0; i < count; i++) {
+                    (function (delay) {
+                        setTimeout(function () {
+                            if (matchCanceled || matchFound || !roundActive) return;
+                            scanOneSlot(hostPeer, mySlot);
+                        }, delay);
+                    })(i * 120);
+                }
+            }
+            doScan(); // 立即首扫
             matchScanInterval = setInterval(function () {
                 if (matchCanceled || matchFound || !roundActive) return;
-                // 一次扫 2 个槽位提高命中率
-                scanOneSlot(hostPeer, mySlot);
-                setTimeout(function () {
-                    if (matchCanceled || matchFound || !roundActive) return;
-                    scanOneSlot(hostPeer, mySlot);
-                }, 600);
-            }, 2500);
+                var fast = (Date.now() - roundStart) < 10000;
+                doScan();
+            }, 700); // 统一用 0.7s 间隔，靠 doScan 内部控制扫几个
 
-            // 首次立即扫描
-            scanOneSlot(hostPeer, mySlot);
-
-            // ==== 计时显示 + 超时重试 ====
+            // ==== 计时显示（总等待时间，不重置） + 超时换槽 ====
             matchTimerInterval = setInterval(function () {
                 if (matchCanceled || matchFound || !roundActive) return;
-                var elapsed = Math.floor((Date.now() - matchStartTime) / 1000);
+                var totalElapsed = Math.floor((Date.now() - matchStartTime) / 1000);
                 var dots = '';
-                for (var d = 0; d < (elapsed % 4) + 1; d++) dots += '.';
-                matchStatusEl.textContent = '🔍 匹配中' + dots + ' 已等待 ' + elapsed + ' 秒';
+                for (var d = 0; d < (totalElapsed % 4) + 1; d++) dots += '.';
+                matchStatusEl.textContent = '🔍 匹配中' + dots + ' 已等待 ' + totalElapsed + ' 秒（第' + matchRetryCount + '轮）';
 
-                // 20 秒超时 → 换槽位重来
-                if (elapsed >= 20 && elapsed % 20 === 0) {
+                // 12 秒本轮超时 → 换槽位重来
+                var roundElapsed = Math.floor((Date.now() - roundStart) / 1000);
+                if (roundElapsed >= 12) {
                     roundActive = false;
                     try { hostPeer.destroy(); } catch (e) {}
                     cleanupMatchResources();
                     if (!matchCanceled) {
-                        matchStatusEl.textContent = '🔍 换个槽位重新搜索...';
+                        matchStatusEl.textContent = '🔍 换槽位重搜...（已等 ' + totalElapsed + ' 秒）';
                         doMatchRound();
                     }
                 }
