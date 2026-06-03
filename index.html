@@ -195,6 +195,57 @@
             0%, 100% { opacity: 1; }
             50%      { opacity: 0.5; }
         }
+
+        /* ---- 匹配按钮 ---- */
+        #match-btn {
+            background: linear-gradient(135deg, #ff6f00, #ff8f00);
+            font-size: 17px;
+            font-weight: bold;
+            padding: 12px 30px;
+            animation: none;
+        }
+        #match-btn:hover { background: linear-gradient(135deg, #e65100, #ff6f00); }
+        #match-btn:disabled { background: #ccc; animation: none; }
+        #match-btn.matching {
+            animation: matchPulse 1s infinite;
+        }
+        @keyframes matchPulse {
+            0%, 100% { box-shadow: 0 0 5px #ff6f00; }
+            50%      { box-shadow: 0 0 25px #ff6f00, 0 0 50px rgba(255,111,0,0.4); }
+        }
+
+        #cancel-match-btn {
+            background-color: #e53935;
+            font-size: 14px;
+        }
+        #cancel-match-btn:hover { background-color: #b71c1c; }
+
+        .match-spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 3px solid rgba(255,255,255,0.4);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .divider {
+            display: flex;
+            align-items: center;
+            margin: 18px 0;
+            color: #999;
+            font-size: 13px;
+        }
+        .divider::before, .divider::after {
+            content: '';
+            flex: 1;
+            border-bottom: 1px solid #ddd;
+        }
+        .divider span { padding: 0 12px; }
     </style>
 </head>
 <body>
@@ -215,6 +266,16 @@
         <div>
             <input type="text" id="room-input" placeholder="输入房间号" maxlength="6" autocomplete="off">
             <button id="join-room-btn">🚪 加入房间</button>
+        </div>
+
+        <!-- 分割线 -->
+        <div class="divider"><span>—— 随机匹配 ——</span></div>
+        <div>
+            <button id="match-btn">🎲 单人匹配</button>
+        </div>
+        <div id="match-status" class="room-info"></div>
+        <div>
+            <button id="cancel-match-btn" class="hidden" style="margin-top:5px;">❌ 取消匹配</button>
         </div>
         <p id="room-code-display"></p>
         <button id="copy-room-btn" class="copy-btn hidden">📋 复制房间号</button>
@@ -293,6 +354,12 @@
         let myPlayer   = null;       // 我是 1(黑/房主) 还是 2(白/加入者)
         let myRoomCode = null;       // 我的房间号
         let amHost     = false;      // 我是不是房主
+
+        // ---------- 匹配状态 ----------
+        let isMatching    = false;    // 是否正在匹配中
+        let matchCanceled = false;    // 是否取消了匹配
+        let matchSlot     = -1;       // 当前匹配槽位
+        const MATCH_SLOTS = 5;        // 匹配槽位数（0~4）
 
         // ---------- ICE 服务器配置（STUN + TURN，提高连接成功率）----------
         const ICE_SERVERS = {
@@ -906,6 +973,231 @@
         }
 
         // =====================================================
+        //  单人匹配
+        // =====================================================
+        const matchStatusEl = document.getElementById('match-status');
+        const matchBtn      = document.getElementById('match-btn');
+        const cancelMatchBtn = document.getElementById('cancel-match-btn');
+
+        // 尝试以客人身份加入某个匹配槽位
+        function tryJoinSlot(slot) {
+            return new Promise(function (resolve) {
+                if (matchCanceled) { resolve(null); return; }
+
+                const guestId = 'gomoku-match-guest-' + slot + '-' + Math.random().toString(36).slice(2, 8);
+                let guestPeer = null;
+                let settled = false;
+
+                const timeout = setTimeout(function () {
+                    if (settled) return;
+                    settled = true;
+                    if (guestPeer) guestPeer.destroy();
+                    resolve(null);
+                }, 2000); // 等 2 秒看能不能连上
+
+                try {
+                    guestPeer = new Peer(guestId, PEER_OPTIONS);
+                } catch (e) {
+                    clearTimeout(timeout);
+                    resolve(null);
+                    return;
+                }
+
+                guestPeer.on('open', function () {
+                    if (settled || matchCanceled) return;
+                    const testConn = guestPeer.connect('gomoku-match-host-' + slot, { reliable: true });
+
+                    testConn.on('open', function () {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timeout);
+                        resolve({ peer: guestPeer, conn: testConn });
+                    });
+                });
+
+                guestPeer.on('error', function () {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    if (guestPeer) { try { guestPeer.destroy(); } catch (e) {} }
+                    resolve(null);
+                });
+            });
+        }
+
+        // 成为匹配房主，等待对手
+        function becomeMatchHost(slot) {
+            return new Promise(function (resolveHost) {
+                if (matchCanceled) { resolveHost(null); return; }
+
+                const hostId = 'gomoku-match-host-' + slot;
+                let hostPeer = null;
+
+                try {
+                    hostPeer = new Peer(hostId, PEER_OPTIONS);
+                } catch (e) {
+                    // ID 被占用，换一个槽位
+                    resolveHost(null);
+                    return;
+                }
+
+                hostPeer.on('open', function () {
+                    if (matchCanceled) { hostPeer.destroy(); resolveHost(null); return; }
+                    matchStatusEl.textContent = '🔍 正在等待对手...（槽位 ' + (slot + 1) + '）';
+                });
+
+                hostPeer.on('connection', function (incomingConn) {
+                    if (matchCanceled) { incomingConn.close(); resolveHost(null); return; }
+                    resolveHost({ peer: hostPeer, conn: incomingConn });
+                });
+
+                hostPeer.on('error', function () {
+                    // ID 冲突，换槽位
+                    try { hostPeer.destroy(); } catch (e) {}
+                    resolveHost(null);
+                });
+            });
+        }
+
+        async function startMatchmaking() {
+            if (isMatching) return;
+            isMatching = true;
+            matchCanceled = false;
+
+            // 禁用其他按钮
+            document.getElementById('create-room-btn').disabled = true;
+            document.getElementById('join-room-btn').disabled = true;
+            roomInput.disabled = true;
+            roomCodeDisplay.textContent = '';
+
+            // 匹配按钮状态
+            matchBtn.disabled = true;
+            matchBtn.classList.add('matching');
+            matchBtn.innerHTML = '<span class="match-spinner"></span>匹配中...';
+            cancelMatchBtn.classList.remove('hidden');
+            matchStatusEl.textContent = '🔍 正在搜索对手...';
+            setStatus('🟡 单人匹配中...', 'status-connecting');
+
+            // 随机打乱槽位顺序
+            const slots = [];
+            for (let i = 0; i < MATCH_SLOTS; i++) slots.push(i);
+            for (let i = slots.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [slots[i], slots[j]] = [slots[j], slots[i]];
+            }
+
+            // ---- 阶段 1：尝试加入已有主机 ----
+            for (let i = 0; i < slots.length; i++) {
+                if (matchCanceled) break;
+                const slot = slots[i];
+                matchStatusEl.textContent = '🔍 搜索中...（' + (i + 1) + '/' + MATCH_SLOTS + '）';
+
+                const result = await tryJoinSlot(slot);
+                if (result) {
+                    // 找到对手！我是白棋（加入者）
+                    matchSlot = slot;
+                    peer = result.peer;
+                    conn = result.conn;
+                    amHost = false;
+                    myPlayer = 2;
+                    myRoomCode = 'MATCH' + slot;
+                    setupConnection();
+                    matchStatusEl.textContent = '✅ 匹配成功！';
+                    setStatus('🟢 已连接！你是 ⚪ 白棋（后手）', 'status-connected');
+                    startGame();
+                    finishMatchUI();
+                    return;
+                }
+            }
+
+            if (matchCanceled) return;
+
+            // ---- 阶段 2：没找到 → 自己当房主 ----
+            matchStatusEl.textContent = '🔍 暂无空闲对手，正在创建等待...';
+
+            let hostResult = null;
+            const hostSlots = [];
+            for (let i = 0; i < MATCH_SLOTS; i++) hostSlots.push(i);
+            for (let i = hostSlots.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [hostSlots[i], hostSlots[j]] = [hostSlots[j], hostSlots[i]];
+            }
+
+            for (let i = 0; i < hostSlots.length; i++) {
+                if (matchCanceled) break;
+                const slot = hostSlots[i];
+                hostResult = await becomeMatchHost(slot);
+                if (hostResult) {
+                    matchSlot = slot;
+                    break;
+                }
+                // 这个槽位被占了，试下一个
+            }
+
+            if (matchCanceled || !hostResult) {
+                if (!matchCanceled) {
+                    matchStatusEl.textContent = '⚠️ 匹配失败，请重试';
+                    resetMatchUI();
+                }
+                return;
+            }
+
+            // 有人连进来了！我是黑棋（房主）
+            peer = hostResult.peer;
+            conn = hostResult.conn;
+            amHost = true;
+            myPlayer = 1;
+            myRoomCode = 'MATCH' + matchSlot;
+            setupConnection();
+            matchStatusEl.textContent = '✅ 匹配成功！';
+            setStatus('🟢 已连接！你是 ⚫ 黑棋（先手）', 'status-connected');
+            startGame();
+            finishMatchUI();
+        }
+
+        function cancelMatchmaking() {
+            if (!isMatching) return;
+            matchCanceled = true;
+            isMatching = false;
+
+            if (peer) {
+                try { peer.destroy(); } catch (e) {}
+                peer = null;
+            }
+            if (conn) {
+                try { conn.close(); } catch (e) {}
+                conn = null;
+            }
+
+            resetMatchUI();
+            matchStatusEl.textContent = '已取消匹配';
+            setStatus('⚪ 未连接', 'status-disconnected');
+            setTimeout(function () { matchStatusEl.textContent = ''; }, 2000);
+        }
+
+        function finishMatchUI() {
+            isMatching = false;
+            matchBtn.disabled = true;
+            matchBtn.classList.remove('matching');
+            matchBtn.innerHTML = '🎲 单人匹配';
+            cancelMatchBtn.classList.add('hidden');
+        }
+
+        function resetMatchUI() {
+            isMatching = false;
+            matchBtn.disabled = false;
+            matchBtn.classList.remove('matching');
+            matchBtn.innerHTML = '🎲 单人匹配';
+            cancelMatchBtn.classList.add('hidden');
+            document.getElementById('create-room-btn').disabled = false;
+            document.getElementById('join-room-btn').disabled = false;
+            roomInput.disabled = false;
+        }
+
+        matchBtn.addEventListener('click', startMatchmaking);
+        cancelMatchBtn.addEventListener('click', cancelMatchmaking);
+
+        // =====================================================
         //  按钮事件
         // =====================================================
         document.getElementById('restart-btn').addEventListener('click', function () {
@@ -969,6 +1261,8 @@
         function cleanup() {
             stopTimer();
             resetTimerDisplay();
+            matchCanceled = true;
+            isMatching = false;
             if (conn) { conn.close(); conn = null; }
             if (peer) { peer.destroy(); peer = null; }
             gameArea.classList.add('hidden');
@@ -980,9 +1274,12 @@
             roomInput.disabled = false;
             roomInput.value = '';
             roomMsg.textContent = '';
+            matchStatusEl.textContent = '';
+            resetMatchUI();
             myPlayer = null;
             amHost = false;
             myRoomCode = null;
+            matchSlot = -1;
             setStatus('⚪ 未连接', 'status-disconnected');
         }
 
