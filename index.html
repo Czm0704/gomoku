@@ -839,6 +839,9 @@
                 return;
             }
 
+            // AI 正在思考中，不能下
+            if (aiThinking) return;
+
             // 不是我的回合
             if (currentPlayer !== myPlayer) return;
 
@@ -1016,201 +1019,243 @@
         }
 
         // =====================================================
-        //  单人匹配
+        //  单人匹配（优化版：同时房主+扫描、超时重试、计时显示、音效）
         // =====================================================
         const matchStatusEl = document.getElementById('match-status');
         const matchBtn      = document.getElementById('match-btn');
         const cancelMatchBtn = document.getElementById('cancel-match-btn');
+        let matchScanInterval = null;   // 扫描定时器
+        let matchTimerInterval = null;  // 计时显示定时器
+        let matchRetryCount    = 0;     // 重试次数
+        let matchStartTime     = 0;     // 开始匹配的时间戳
 
-        // 尝试以客人身份加入某个匹配槽位
-        function tryJoinSlot(slot) {
-            return new Promise(function (resolve) {
-                if (matchCanceled) { resolve(null); return; }
-
-                const guestId = 'gomoku-match-guest-' + slot + '-' + Math.random().toString(36).slice(2, 8);
-                let guestPeer = null;
-                let settled = false;
-
-                const timeout = setTimeout(function () {
-                    if (settled) return;
-                    settled = true;
-                    if (guestPeer) guestPeer.destroy();
-                    resolve(null);
-                }, 2000); // 等 2 秒看能不能连上
-
-                try {
-                    guestPeer = new Peer(guestId, PEER_OPTIONS);
-                } catch (e) {
-                    clearTimeout(timeout);
-                    resolve(null);
-                    return;
-                }
-
-                guestPeer.on('open', function () {
-                    if (settled || matchCanceled) return;
-                    const testConn = guestPeer.connect('gomoku-match-host-' + slot, { reliable: true });
-
-                    testConn.on('open', function () {
-                        if (settled) return;
-                        settled = true;
-                        clearTimeout(timeout);
-                        resolve({ peer: guestPeer, conn: testConn });
-                    });
+        // ---- 匹配成功音效（Web Audio API，无需外部文件） ----
+        function playMatchSound() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const notes = [523, 659, 784, 1047]; // C5 E5 G5 C6 上行琶音
+                notes.forEach(function (freq, i) {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.value = freq;
+                    gain.gain.setValueAtTime(0.25, ctx.currentTime + i * 0.12);
+                    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + i * 0.12 + 0.35);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(ctx.currentTime + i * 0.12);
+                    osc.stop(ctx.currentTime + i * 0.12 + 0.35);
                 });
-
-                guestPeer.on('error', function () {
-                    if (settled) return;
-                    settled = true;
-                    clearTimeout(timeout);
-                    if (guestPeer) { try { guestPeer.destroy(); } catch (e) {} }
-                    resolve(null);
-                });
-            });
+            } catch (e) { /* 静默失败 */ }
         }
 
-        // 成为匹配房主，等待对手
-        function becomeMatchHost(slot) {
-            return new Promise(function (resolveHost) {
-                if (matchCanceled) { resolveHost(null); return; }
+        // ---- 清理所有匹配资源 ----
+        function cleanupMatchResources() {
+            if (matchScanInterval) { clearInterval(matchScanInterval); matchScanInterval = null; }
+            if (matchTimerInterval) { clearInterval(matchTimerInterval); matchTimerInterval = null; }
+        }
 
-                const hostId = 'gomoku-match-host-' + slot;
-                let hostPeer = null;
+        // ---- 匹配成功后的处理 ----
+        function onMatchFound(peerInst, connInst, isHost, slot) {
+            cleanupMatchResources();
+            matchFound = true;
+            peer = peerInst;
+            conn = connInst;
+            amHost = isHost;
+            myPlayer = isHost ? 1 : 2;
+            myRoomCode = 'MATCH' + slot;
+            setupConnection();
+            playMatchSound();
+            matchStatusEl.textContent = '✅ 匹配成功！';
+            setStatus(isHost
+                ? '🟢 已连接！你是 ⚫ 黑棋（先手）'
+                : '🟢 已连接！你是 ⚪ 白棋（后手）', 'status-connected');
+            startGame();
+            finishMatchUI();
+        }
 
-                try {
-                    hostPeer = new Peer(hostId, PEER_OPTIONS);
-                } catch (e) {
-                    // ID 被占用，换一个槽位
-                    resolveHost(null);
-                    return;
-                }
+        // ---- 扫描其他槽位（只扫一次，快速探测） ----
+        function scanOneSlot(hostPeer, mySlot) {
+            if (matchCanceled || matchFound) return;
+            // 选一个不同于自己的槽位
+            var scanSlot = mySlot;
+            while (scanSlot === mySlot) {
+                scanSlot = Math.floor(Math.random() * MATCH_SLOTS);
+            }
 
-                hostPeer.on('open', function () {
-                    if (matchCanceled) { hostPeer.destroy(); resolveHost(null); return; }
-                    matchStatusEl.textContent = '🔍 正在等待对手...（槽位 ' + (slot + 1) + '）';
-                });
+            var guestPeer = null;
+            try {
+                guestPeer = new Peer('gomoku-match-scan-' + scanSlot + '-' + Date.now(), PEER_OPTIONS);
+            } catch (e) { return; }
 
-                hostPeer.on('connection', function (incomingConn) {
-                    if (matchCanceled) { incomingConn.close(); resolveHost(null); return; }
-                    resolveHost({ peer: hostPeer, conn: incomingConn });
-                });
+            var settled = false;
 
-                hostPeer.on('error', function () {
-                    // ID 冲突，换槽位
+            var timeout = setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                try { guestPeer.destroy(); } catch (e) {}
+            }, 1800);
+
+            guestPeer.on('open', function () {
+                if (settled || matchCanceled || matchFound) return;
+                var testConn = guestPeer.connect('gomoku-match-host-' + scanSlot, { reliable: true });
+
+                testConn.on('open', function () {
+                    if (settled || matchCanceled || matchFound) return;
+                    settled = true;
+                    clearTimeout(timeout);
+
+                    // 找到了另一个等待者！我是白棋
                     try { hostPeer.destroy(); } catch (e) {}
-                    resolveHost(null);
+                    onMatchFound(guestPeer, testConn, false, scanSlot);
                 });
+            });
+
+            guestPeer.on('error', function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                try { guestPeer.destroy(); } catch (e) {}
             });
         }
 
-        async function startMatchmaking() {
+        // ---- 主匹配逻辑 ----
+        function startMatchmaking() {
             if (isMatching) return;
             isMatching = true;
             matchCanceled = false;
+            matchFound = false;
+            matchRetryCount = 0;
+            matchStartTime = Date.now();
 
-            // 禁用其他按钮
+            // 清理旧资源
+            cleanupMatchResources();
+            if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+            if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+
+            // 禁用按钮
             document.getElementById('create-room-btn').disabled = true;
             document.getElementById('join-room-btn').disabled = true;
             aiBtn.disabled = true;
             roomInput.disabled = true;
             roomCodeDisplay.textContent = '';
 
-            // 匹配按钮状态
+            // UI 状态
             matchBtn.disabled = true;
             matchBtn.classList.add('matching');
             matchBtn.innerHTML = '<span class="match-spinner"></span>匹配中...';
             cancelMatchBtn.classList.remove('hidden');
             matchStatusEl.textContent = '🔍 正在搜索对手...';
-            setStatus('🟡 单人匹配中...', 'status-connecting');
+            setStatus('🟡 匹配中...', 'status-connecting');
 
-            // 随机打乱槽位顺序
-            const slots = [];
-            for (let i = 0; i < MATCH_SLOTS; i++) slots.push(i);
-            for (let i = slots.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [slots[i], slots[j]] = [slots[j], slots[i]];
-            }
+            // 开始一轮匹配
+            doMatchRound();
+        }
 
-            // ---- 阶段 1：尝试加入已有主机 ----
-            for (let i = 0; i < slots.length; i++) {
-                if (matchCanceled) break;
-                const slot = slots[i];
-                matchStatusEl.textContent = '🔍 搜索中...（' + (i + 1) + '/' + MATCH_SLOTS + '）';
+        function doMatchRound() {
+            if (matchCanceled || matchFound) return;
+            matchRetryCount++;
 
-                const result = await tryJoinSlot(slot);
-                if (result) {
-                    // 找到对手！我是白棋（加入者）
-                    matchSlot = slot;
-                    peer = result.peer;
-                    conn = result.conn;
-                    amHost = false;
-                    myPlayer = 2;
-                    myRoomCode = 'MATCH' + slot;
-                    setupConnection();
-                    matchStatusEl.textContent = '✅ 匹配成功！';
-                    setStatus('🟢 已连接！你是 ⚪ 白棋（后手）', 'status-connected');
-                    startGame();
-                    finishMatchUI();
-                    return;
-                }
-            }
+            var mySlot = Math.floor(Math.random() * MATCH_SLOTS);
+            var hostPeer = null;
+            var roundActive = true;
 
-            if (matchCanceled) return;
-
-            // ---- 阶段 2：没找到 → 自己当房主 ----
-            matchStatusEl.textContent = '🔍 暂无空闲对手，正在创建等待...';
-
-            let hostResult = null;
-            const hostSlots = [];
-            for (let i = 0; i < MATCH_SLOTS; i++) hostSlots.push(i);
-            for (let i = hostSlots.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [hostSlots[i], hostSlots[j]] = [hostSlots[j], hostSlots[i]];
-            }
-
-            for (let i = 0; i < hostSlots.length; i++) {
-                if (matchCanceled) break;
-                const slot = hostSlots[i];
-                hostResult = await becomeMatchHost(slot);
-                if (hostResult) {
-                    matchSlot = slot;
-                    break;
-                }
-                // 这个槽位被占了，试下一个
-            }
-
-            if (matchCanceled || !hostResult) {
+            // 尝试创建房主 Peer
+            try {
+                hostPeer = new Peer('gomoku-match-host-' + mySlot, PEER_OPTIONS);
+            } catch (e) {
+                // ID 被占，换槽位重试
                 if (!matchCanceled) {
-                    matchStatusEl.textContent = '⚠️ 匹配失败，请重试';
-                    resetMatchUI();
+                    setTimeout(function () { doMatchRound(); }, 500);
                 }
                 return;
             }
 
-            // 有人连进来了！我是黑棋（房主）
-            peer = hostResult.peer;
-            conn = hostResult.conn;
-            amHost = true;
-            myPlayer = 1;
-            myRoomCode = 'MATCH' + matchSlot;
-            setupConnection();
-            matchStatusEl.textContent = '✅ 匹配成功！';
-            setStatus('🟢 已连接！你是 ⚫ 黑棋（先手）', 'status-connected');
-            startGame();
-            finishMatchUI();
+            hostPeer.on('open', function () {
+                if (matchCanceled || matchFound || !roundActive) return;
+                matchStatusEl.textContent = '🔍 匹配中... 第 ' + matchRetryCount + ' 轮';
+            });
+
+            // 有人连进来了 → 我是黑棋（房主）
+            hostPeer.on('connection', function (incomingConn) {
+                if (matchFound || matchCanceled || !roundActive) {
+                    try { incomingConn.close(); } catch (e) {}
+                    return;
+                }
+                roundActive = false;
+                onMatchFound(hostPeer, incomingConn, true, mySlot);
+            });
+
+            hostPeer.on('error', function () {
+                if (matchCanceled || matchFound || !roundActive) return;
+                roundActive = false;
+                try { hostPeer.destroy(); } catch (e) {}
+                // ID 冲突，换槽位
+                if (!matchCanceled) {
+                    setTimeout(function () { doMatchRound(); }, 800);
+                }
+            });
+
+            // ==== 扫描定时器：每 2.5 秒扫一次其他槽位 ====
+            matchScanInterval = setInterval(function () {
+                if (matchCanceled || matchFound || !roundActive) return;
+                // 一次扫 2 个槽位提高命中率
+                scanOneSlot(hostPeer, mySlot);
+                setTimeout(function () {
+                    if (matchCanceled || matchFound || !roundActive) return;
+                    scanOneSlot(hostPeer, mySlot);
+                }, 600);
+            }, 2500);
+
+            // 首次立即扫描
+            scanOneSlot(hostPeer, mySlot);
+
+            // ==== 计时显示 + 超时重试 ====
+            matchTimerInterval = setInterval(function () {
+                if (matchCanceled || matchFound || !roundActive) return;
+                var elapsed = Math.floor((Date.now() - matchStartTime) / 1000);
+                var dots = '';
+                for (var d = 0; d < (elapsed % 4) + 1; d++) dots += '.';
+                matchStatusEl.textContent = '🔍 匹配中' + dots + ' 已等待 ' + elapsed + ' 秒';
+
+                // 20 秒超时 → 换槽位重来
+                if (elapsed >= 20 && elapsed % 20 === 0) {
+                    roundActive = false;
+                    try { hostPeer.destroy(); } catch (e) {}
+                    cleanupMatchResources();
+                    if (!matchCanceled) {
+                        matchStatusEl.textContent = '🔍 换个槽位重新搜索...';
+                        doMatchRound();
+                    }
+                }
+            }, 1000);
+
+            // 存储 hostPeer 引用以便取消时清理
+            matchCurrentHostPeer = hostPeer;
         }
+
+        var matchFound = false;
+        var matchCurrentHostPeer = null;
 
         function cancelMatchmaking() {
             if (!isMatching) return;
             matchCanceled = true;
             isMatching = false;
+            matchFound = false;
 
-            if (peer) {
-                try { peer.destroy(); } catch (e) {}
-                peer = null;
+            cleanupMatchResources();
+
+            if (matchCurrentHostPeer) {
+                try { matchCurrentHostPeer.destroy(); } catch (e) {}
+                matchCurrentHostPeer = null;
             }
             if (conn) {
                 try { conn.close(); } catch (e) {}
                 conn = null;
+            }
+            if (peer && peer !== matchCurrentHostPeer) {
+                try { peer.destroy(); } catch (e) {}
+                peer = null;
             }
 
             resetMatchUI();
@@ -1221,6 +1266,7 @@
 
         function finishMatchUI() {
             isMatching = false;
+            matchFound = false;
             matchBtn.disabled = true;
             matchBtn.classList.remove('matching');
             matchBtn.innerHTML = '🎲 匹配真人';
@@ -1229,6 +1275,7 @@
 
         function resetMatchUI() {
             isMatching = false;
+            matchFound = false;
             matchBtn.disabled = false;
             matchBtn.classList.remove('matching');
             matchBtn.innerHTML = '🎲 匹配真人';
@@ -1277,15 +1324,37 @@
         }
 
         // ---- 检查某位置周围 2 格内是否有棋子（优化性能） ----
-        function aiHasNeighbor(row, col) {
-            for (let dr = -2; dr <= 2; dr++) {
-                for (let dc = -2; dc <= 2; dc++) {
+        function aiHasNeighbor(row, col, dist) {
+            const d = dist || 2;
+            for (let dr = -d; dr <= d; dr++) {
+                for (let dc = -d; dc <= d; dc++) {
                     if (dr===0 && dc===0) continue;
                     const r = row+dr, c = col+dc;
                     if (r>=0 && r<BOARD_SIZE && c>=0 && c<BOARD_SIZE && board[r][c]!==0) return true;
                 }
             }
             return false;
+        }
+
+        // ---- 找一个有效空位（兜底保障） ----
+        function aiFindAnyEmpty() {
+            // 优先找靠近中心且周围有子的空位
+            const center = 7;
+            const candidates = [];
+            for (let r = 0; r < BOARD_SIZE; r++) {
+                for (let c = 0; c < BOARD_SIZE; c++) {
+                    if (board[r][c] === 0) {
+                        const dist = Math.abs(r - center) + Math.abs(c - center);
+                        candidates.push({row: r, col: c, dist: dist});
+                    }
+                }
+            }
+            if (candidates.length === 0) return {row: 7, col: 7};
+            // 按距离中心排序
+            candidates.sort(function(a, b) { return a.dist - b.dist; });
+            // 从前 5 个中随机选
+            const top = candidates.slice(0, Math.min(5, candidates.length));
+            return top[Math.floor(Math.random() * top.length)];
         }
 
         // ---- AI 选择最佳落子 ----
@@ -1295,48 +1364,105 @@
             let bestScore = -1;
             let bestMoves = [];
 
+            // 第1轮：在邻近棋子的位置中找最佳
             for (let r = 0; r < BOARD_SIZE; r++) {
                 for (let c = 0; c < BOARD_SIZE; c++) {
                     if (board[r][c] !== 0) continue;
-                    if (!aiHasNeighbor(r, c)) continue;
+                    if (!aiHasNeighbor(r, c, 2)) continue;
 
                     const attack  = aiEvalPos(r, c, aiPlayer);
                     const defense = aiEvalPos(r, c, humanPlayer);
-                    // 防守权重略高，优先堵对手的棋
                     const score = Math.max(attack, defense * 1.05);
 
                     if (score > bestScore) {
                         bestScore = score;
                         bestMoves = [{row: r, col: c}];
-                    } else if (score === bestScore && score > 0) {
+                    } else if (Math.abs(score - bestScore) < 0.001) {
                         bestMoves.push({row: r, col: c});
                     }
                 }
             }
 
-            // 空棋盘 → 下天元
-            if (bestMoves.length === 0) return {row: 7, col: 7};
-            // 随机选一个最高分位置（增加变化）
-            return bestMoves[Math.floor(Math.random() * bestMoves.length)];
+            // 第2轮：如果没找到（所有邻近位置得分=0），扩大搜索范围到全盘
+            if (bestMoves.length === 0) {
+                for (let r = 0; r < BOARD_SIZE; r++) {
+                    for (let c = 0; c < BOARD_SIZE; c++) {
+                        if (board[r][c] !== 0) continue;
+                        // 宽松条件：只要周围3格内有子就行
+                        if (!aiHasNeighbor(r, c, 3)) continue;
+
+                        const attack  = aiEvalPos(r, c, aiPlayer);
+                        const defense = aiEvalPos(r, c, humanPlayer);
+                        const score = Math.max(attack, defense * 1.05);
+
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestMoves = [{row: r, col: c}];
+                        } else if (Math.abs(score - bestScore) < 0.001) {
+                            bestMoves.push({row: r, col: c});
+                        }
+                    }
+                }
+            }
+
+            // 第3轮（兜底）：全盘任意空位
+            if (bestMoves.length === 0) {
+                console.log('AI 兜底：全盘寻找空位');
+                return aiFindAnyEmpty();
+            }
+
+            // 随机选一个最高分位置
+            const pick = bestMoves[Math.floor(Math.random() * bestMoves.length)];
+            // 安全检查：确保位置确实为空
+            if (board[pick.row][pick.col] !== 0) {
+                console.warn('AI 选中已占用位置，切换兜底', pick);
+                return aiFindAnyEmpty();
+            }
+            return pick;
         }
 
         // ---- AI 执行落子 ----
         function aiMakeMove() {
-            if (gameOver || !isAI) return;
+            if (gameOver || !isAI) {
+                console.log('AI跳过：gameOver=' + gameOver + ', isAI=' + isAI);
+                return;
+            }
             aiThinking = true;
 
-            const move = aiFindBestMove();
-            const row = move.row, col = move.col;
+            // 状态栏显示 AI 思考中
+            statusText.textContent = '白棋（AI 思考中...）';
+            statusText.style.color = '#7b1fa2';
+
+            var move;
+            try {
+                move = aiFindBestMove();
+                console.log('AI 选择落子：', move.row, move.col);
+            } catch (e) {
+                console.error('AI 计算失败：', e);
+                move = aiFindAnyEmpty();
+            }
+
+            var row = move.row, col = move.col;
+
+            // 最终安全检查
+            if (board[row][col] !== 0) {
+                console.warn('AI 落子位置冲突 (' + row + ',' + col + ')，重新选择');
+                move = aiFindAnyEmpty();
+                row = move.row;
+                col = move.col;
+                if (board[row][col] !== 0) {
+                    // 极端情况：棋盘满了
+                    aiThinking = false;
+                    return;
+                }
+            }
 
             // 落子
-            board[row][col] = 2; // AI 永远是白棋
-            moveHistory.push({ row, col, player: 2 });
-            lastMove = { row, col };
+            board[row][col] = 2;
+            moveHistory.push({ row: row, col: col, player: 2 });
+            lastMove = { row: row, col: col };
 
-            // 发消息（如果有联机连接才发，AI 模式不需要）
-            if (!isAI) sendToPeer({ type: 'move', row, col, player: 2 });
-
-            const result = checkWin(row, col);
+            var result = checkWin(row, col);
             if (result) {
                 gameOver = true;
                 winner = result;
@@ -1347,10 +1473,11 @@
                 statusText.style.color = '#c62828';
                 currentPlayerDot.style.backgroundColor = 'transparent';
                 canvas.style.cursor = 'pointer';
+                canvas.style.opacity = '1';
             } else {
-                currentPlayer = 1; // 回到玩家回合
+                currentPlayer = 1;
                 drawBoard();
-                updateStatusDisplay(); // 启动玩家计时器
+                updateStatusDisplay();
             }
             aiThinking = false;
         }
@@ -1363,7 +1490,7 @@
 
             isAI = true;
             amHost = true;
-            myPlayer = 1;        // 玩家永远是黑棋
+            myPlayer = 1;
             myRoomCode = 'AI';
             aiThinking = false;
 
@@ -1375,6 +1502,7 @@
             matchStatusEl.textContent = '🤖 对战 AI 中...';
             setStatus('🤖 对战 AI — 你是 ⚫ 黑棋（先手）', 'status-connected');
             startGame();
+            console.log('AI 对战模式已启动，你是黑棋先手');
         }
 
         aiBtn.addEventListener('click', startAIGame);
@@ -1464,8 +1592,11 @@
             resetTimerDisplay();
             matchCanceled = true;
             isMatching = false;
+            matchFound = false;
             isAI = false;
             aiThinking = false;
+            cleanupMatchResources();
+            if (matchCurrentHostPeer) { try { matchCurrentHostPeer.destroy(); } catch(e) {} matchCurrentHostPeer = null; }
             if (conn) { conn.close(); conn = null; }
             if (peer) { peer.destroy(); peer = null; }
             gameArea.classList.add('hidden');
