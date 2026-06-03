@@ -160,6 +160,41 @@
         }
 
         .hidden { display: none !important; }
+
+        /* ---- 倒计时 ---- */
+        #timer-bar-outer {
+            width: 300px;
+            height: 28px;
+            background: #ddd;
+            border-radius: 14px;
+            margin: 10px auto;
+            overflow: hidden;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.15);
+            position: relative;
+        }
+        #timer-bar-inner {
+            height: 100%;
+            width: 100%;
+            background: linear-gradient(90deg, #4caf50, #8bc34a);
+            border-radius: 14px;
+            transition: width 0.3s linear;
+        }
+        #timer-bar-inner.warning { background: linear-gradient(90deg, #ff9800, #ffc107); }
+        #timer-bar-inner.danger  { background: linear-gradient(90deg, #f44336, #ff5722); animation: pulse 0.5s infinite; }
+        #timer-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-weight: bold;
+            font-size: 15px;
+            color: #333;
+            text-shadow: 0 0 3px rgba(255,255,255,0.8);
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%      { opacity: 0.5; }
+        }
     </style>
 </head>
 <body>
@@ -199,6 +234,11 @@
 
         <canvas id="board" width="600" height="600"></canvas>
 
+        <div id="timer-bar-outer">
+            <div id="timer-bar-inner"></div>
+            <span id="timer-text">25</span>
+        </div>
+
         <br>
         <button class="action-btn" id="restart-btn">🔄 重新开始（双方同意）</button>
         <button class="action-btn" id="undo-btn">↩ 悔棋</button>
@@ -207,7 +247,9 @@
 
     <!-- ====== 规则 ====== -->
     <div id="instructions">
-        🖱 轮到你时点击棋盘落子<br>
+        🖱 轮到你时<b>双击</b>棋盘落子<br>
+        ⏱ 每步限时 <b>25 秒</b>，超时判负<br>
+        🔴 红点标记上一步落子位置<br>
         ⚫ 房主执黑先手 | ⚪ 加入者执白后手<br>
         🏆 横、竖、斜任意方向先连成 5 子即为胜利
     </div>
@@ -241,6 +283,9 @@
         let gameOver      = false;
         let winner        = null;
         let moveHistory   = [];
+        let lastMove      = null;    // {row, col} 上一步落子位置
+        let timeLeft      = 25;      // 当前回合剩余秒数
+        let timerInterval = null;    // 计时器 ID
 
         // ---------- 联机状态 ----------
         let peer       = null;       // PeerJS 实例
@@ -347,6 +392,20 @@
                 }
             }
 
+            // 上一步落子标记（小红点闪烁指示）
+            if (lastMove && board[lastMove.row][lastMove.col] !== 0) {
+                const lx = PADDING + lastMove.col * CELL_SIZE;
+                const ly = PADDING + lastMove.row * CELL_SIZE;
+                ctx.fillStyle = 'rgba(255, 50, 50, 0.85)';
+                ctx.beginPath();
+                ctx.arc(lx, ly, 5.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.lineWidth = 1;
+            }
+
             // 赢了画标记 + 文字
             if (winner) {
                 drawWinHighlight();
@@ -364,7 +423,7 @@
 
                     ctx.fillStyle = '#ffeb3b';
                     ctx.font = 'bold 18px "Microsoft YaHei", "微软雅黑", sans-serif';
-                    ctx.fillText('👆 点击棋盘重新开始', canvas.width/2, canvas.height/2 + 35);
+                    ctx.fillText('👆 双击棋盘重新开始', canvas.width/2, canvas.height/2 + 35);
                 } else {
                     // ---- 我输了！----
                     ctx.fillStyle = '#ff6b6b';  // 红色
@@ -374,7 +433,7 @@
 
                     ctx.fillStyle = '#ffeb3b';
                     ctx.font = 'bold 18px "Microsoft YaHei", "微软雅黑", sans-serif';
-                    ctx.fillText('👆 等待对方点击棋盘重新开始', canvas.width/2, canvas.height/2 + 35);
+                    ctx.fillText('👆 等待对方双击棋盘重新开始', canvas.width/2, canvas.height/2 + 35);
                 }
             }
         }
@@ -464,6 +523,77 @@
             const isMyTurn = (currentPlayer === myPlayer) && !gameOver;
             canvas.style.cursor = isMyTurn ? 'pointer' : 'not-allowed';
             canvas.style.opacity = isMyTurn ? '1' : '0.85';
+
+            // 启动/停止倒计时
+            if (isMyTurn) {
+                startTimer();
+            } else if (!gameOver) {
+                // 对手回合，显示等待但不停表（表在对家那边跑）
+                stopTimer();
+                resetTimerDisplay();
+            }
+        }
+
+        // =====================================================
+        //  倒计时
+        // =====================================================
+        function updateTimerDisplay() {
+            const bar = document.getElementById('timer-bar-inner');
+            const text = document.getElementById('timer-text');
+            const pct = (timeLeft / 25) * 100;
+            bar.style.width = pct + '%';
+            text.textContent = timeLeft + 's';
+
+            bar.classList.remove('warning', 'danger');
+            if (timeLeft <= 5) {
+                bar.classList.add('danger');
+            } else if (timeLeft <= 10) {
+                bar.classList.add('warning');
+            }
+        }
+
+        function resetTimerDisplay() {
+            timeLeft = 25;
+            const bar = document.getElementById('timer-bar-inner');
+            const text = document.getElementById('timer-text');
+            bar.style.width = '100%';
+            bar.classList.remove('warning', 'danger');
+            text.textContent = '--';
+        }
+
+        function startTimer() {
+            stopTimer();
+            if (gameOver) return;
+            timeLeft = 25;
+            updateTimerDisplay();
+
+            timerInterval = setInterval(function () {
+                timeLeft--;
+                updateTimerDisplay();
+
+                if (timeLeft <= 0) {
+                    // 超时！当前走棋方判负
+                    stopTimer();
+                    gameOver = true;
+                    winner = { player: (myPlayer === 1 ? 2 : 1), positions: [] }; // 对方赢
+
+                    // 通知对方我超时了
+                    sendToPeer({ type: 'timeout', loser: myPlayer });
+
+                    drawBoard();
+                    statusText.textContent = '⏰ 超时！你输了...';
+                    statusText.style.color = '#c62828';
+                    currentPlayerDot.style.backgroundColor = 'transparent';
+                    canvas.style.cursor = 'pointer'; // 允许点击重开
+                }
+            }, 1000);
+        }
+
+        function stopTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
         }
 
         // =====================================================
@@ -479,6 +609,9 @@
             gameOver = false;
             winner = null;
             moveHistory = [];
+            lastMove = null;     // 清除上一步标记
+            stopTimer();
+            resetTimerDisplay();
             updateStatusDisplay();
             drawBoard();
         }
@@ -502,22 +635,38 @@
                     // 对方下了一步棋
                     board[data.row][data.col] = data.player;
                     moveHistory.push({ row: data.row, col: data.col, player: data.player });
+                    lastMove = { row: data.row, col: data.col };  // 标记上一步
 
                     const result = checkWin(data.row, data.col);
                     if (result) {
                         gameOver = true;
                         winner = result;
+                        stopTimer();
+                        resetTimerDisplay();
                         drawBoard();
                         const name = result.player === 1 ? '⚫ 黑棋' : '⚪ 白棋';
                         const isMe = result.player === myPlayer;
-                        statusText.textContent = isMe ? `${name}（你）获胜！点击棋盘重开` : `${name}（对方）获胜！等待重开`;
+                        statusText.textContent = isMe ? `${name}（你）获胜！双击棋盘重开` : `${name}（对方）获胜！等待重开`;
                         statusText.style.color = isMe ? '#2e7d32' : '#c62828';
                         currentPlayerDot.style.backgroundColor = 'transparent';
                     } else {
                         currentPlayer = (data.player === 1) ? 2 : 1;
                         drawBoard();
-                        updateStatusDisplay();
+                        updateStatusDisplay();  // 轮到我了，这里会启动计时器
                     }
+                    break;
+
+                case 'timeout':
+                    // 对方超时 → 我赢了！
+                    stopTimer();
+                    resetTimerDisplay();
+                    gameOver = true;
+                    winner = { player: myPlayer, positions: [] };
+                    drawBoard();
+                    statusText.textContent = '⏰ 对方超时！你赢了！🏆';
+                    statusText.style.color = '#2e7d32';
+                    currentPlayerDot.style.backgroundColor = 'transparent';
+                    canvas.style.cursor = 'pointer';
                     break;
 
                 case 'restart-request':
@@ -542,6 +691,8 @@
                                 const last = moveHistory.pop();
                                 board[last.row][last.col] = 0;
                             }
+                            // 更新上一步标记
+                            lastMove = moveHistory.length > 0 ? moveHistory[moveHistory.length - 1] : null;
                             // 恢复到对方回合
                             currentPlayer = data.fromPlayer;
                             drawBoard();
@@ -558,6 +709,7 @@
                             const last = moveHistory.pop();
                             board[last.row][last.col] = 0;
                         }
+                        lastMove = moveHistory.length > 0 ? moveHistory[moveHistory.length - 1] : null;
                         currentPlayer = myPlayer;
                         drawBoard();
                         updateStatusDisplay();
@@ -567,6 +719,8 @@
                 case 'player-left':
                     // 对方离开了
                     setStatus('🔴 对方已离开房间', 'status-disconnected');
+                    stopTimer();
+                    resetTimerDisplay();
                     gameOver = true;
                     canvas.style.cursor = 'not-allowed';
                     break;
@@ -574,10 +728,10 @@
         }
 
         // =====================================================
-        //  点击棋盘
+        //  双击棋盘落子
         // =====================================================
-        canvas.addEventListener('click', function (event) {
-            // 已结束 → 点击重开（只有房主可以发起重开请求）
+        canvas.addEventListener('dblclick', function (event) {
+            // 已结束 → 双击重开（只有房主可以发起重开请求）
             if (gameOver) {
                 sendToPeer({ type: 'restart-request' });
                 return;
@@ -598,6 +752,10 @@
             // ---- 落子 ----
             board[row][col] = myPlayer;
             moveHistory.push({ row, col, player: myPlayer });
+            lastMove = { row, col };    // 标记上一步
+
+            // 停止我的计时
+            stopTimer();
 
             // 发送给对方
             sendToPeer({ type: 'move', row, col, player: myPlayer });
@@ -606,15 +764,18 @@
             if (result) {
                 gameOver = true;
                 winner = result;
+                stopTimer();
+                resetTimerDisplay();
                 drawBoard();
                 const name = result.player === 1 ? '⚫ 黑棋' : '⚪ 白棋';
-                statusText.textContent = `${name}（你）获胜！点击棋盘重开`;
+                statusText.textContent = `${name}（你）获胜！双击棋盘重开`;
                 statusText.style.color = '#2e7d32';
                 currentPlayerDot.style.backgroundColor = 'transparent';
             } else {
                 currentPlayer = (myPlayer === 1) ? 2 : 1;
                 drawBoard();
                 updateStatusDisplay();
+                // 对手回合的计时器在 updateStatusDisplay 中启动
             }
         });
 
@@ -720,6 +881,8 @@
 
             conn.on('close', function () {
                 setStatus('🔴 连接断开', 'status-disconnected');
+                stopTimer();
+                resetTimerDisplay();
                 gameOver = true;
                 canvas.style.cursor = 'not-allowed';
             });
@@ -804,6 +967,8 @@
         //  清理
         // =====================================================
         function cleanup() {
+            stopTimer();
+            resetTimerDisplay();
             if (conn) { conn.close(); conn = null; }
             if (peer) { peer.destroy(); peer = null; }
             gameArea.classList.add('hidden');
