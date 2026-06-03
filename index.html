@@ -814,6 +814,46 @@
                     }
                     break;
 
+                // ---- 匹配握手 ----
+                case 'match-hello':
+                    // 双方交换槽位信息，高槽位当"裁判"决定颜色
+                    matchRemoteSlot = data.slot;
+                    matchRemoteIsHost = data.isHost;
+
+                    if (matchSlot > matchRemoteSlot) {
+                        // 我的槽位更高 → 我决定颜色
+                        matchIAmJudge = true;
+                        var seed = Math.random();
+                        myPlayer = (seed > 0.5) ? 1 : 2;
+                        sendToPeer({ type: 'match-init', seed: seed });
+                        setStatus('🟢 已连接！你是 ' + (myPlayer === 1 ? '⚫ 黑棋（先手）' : '⚪ 白棋（后手）'), 'status-connected');
+                        startGame();
+                    } else if (matchSlot < matchRemoteSlot) {
+                        // 对方槽位更高 → 等对方发 match-init
+                        matchIAmJudge = false;
+                    } else {
+                        // 槽位相同（极低概率），用 isHost 决斗
+                        if (data.isHost && !amHost) {
+                            matchIAmJudge = false;
+                        } else {
+                            matchIAmJudge = true;
+                            var seed2 = Math.random();
+                            myPlayer = (seed2 > 0.5) ? 1 : 2;
+                            sendToPeer({ type: 'match-init', seed: seed2 });
+                            setStatus('🟢 已连接！你是 ' + (myPlayer === 1 ? '⚫ 黑棋（先手）' : '⚪ 白棋（后手）'), 'status-connected');
+                            startGame();
+                        }
+                    }
+                    break;
+
+                case 'match-init':
+                    // 裁判决定了颜色，我服从（我的颜色 = 对方颜色的反面）
+                    if (myPlayer !== null) return; // 已设置过，忽略
+                    myPlayer = (data.seed > 0.5) ? 2 : 1;
+                    setStatus('🟢 已连接！你是 ' + (myPlayer === 1 ? '⚫ 黑棋（先手）' : '⚪ 白棋（后手）'), 'status-connected');
+                    startGame();
+                    break;
+
                 case 'player-left':
                     // 对方离开了
                     setStatus('🔴 对方已离开房间', 'status-disconnected');
@@ -1055,23 +1095,24 @@
             if (matchTimerInterval) { clearInterval(matchTimerInterval); matchTimerInterval = null; }
         }
 
-        // ---- 匹配成功后的处理 ----
+        // ---- 匹配成功后的处理（握手协议：交换槽位 → 高槽位定颜色 → 同步开局） ----
         function onMatchFound(peerInst, connInst, isHost, slot) {
             cleanupMatchResources();
             matchFound = true;
             peer = peerInst;
             conn = connInst;
             amHost = isHost;
-            myPlayer = isHost ? 1 : 2;
+            myPlayer = null;           // 等握手后再定
             myRoomCode = 'MATCH' + slot;
+            matchSlot = slot;
             setupConnection();
             playMatchSound();
-            matchStatusEl.textContent = '✅ 匹配成功！';
-            setStatus(isHost
-                ? '🟢 已连接！你是 ⚫ 黑棋（先手）'
-                : '🟢 已连接！你是 ⚪ 白棋（后手）', 'status-connected');
-            startGame();
+            matchStatusEl.textContent = '✅ 匹配成功！正在协商...';
+            setStatus('🟢 已连接！正在同步...', 'status-connected');
             finishMatchUI();
+
+            // 发送握手：告知对方我的槽位和角色
+            sendToPeer({ type: 'match-hello', slot: slot, isHost: isHost });
         }
 
         // ---- 扫描其他槽位（只扫一次，快速探测） ----
@@ -1236,6 +1277,9 @@
 
         var matchFound = false;
         var matchCurrentHostPeer = null;
+        var matchRemoteSlot = -1;      // 对方的槽位
+        var matchRemoteIsHost = false; // 对方是否自称房主
+        var matchIAmJudge = false;     // 我是否负责决定颜色
 
         function cancelMatchmaking() {
             if (!isMatching) return;
